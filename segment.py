@@ -21,7 +21,7 @@ import config
 # Set this to your Canvas group number before you run anything else. It is the
 # seed for every run you report, and channel.py reads it from this file, so the
 # three programs can never disagree about it.
-SEED = 0
+SEED = 16
 
 HEADER = "!IIBxHHH"  # seqNum, ackNum, flags, pad, checksum, rcvWin, length
 HEADER_LEN = struct.calcsize(HEADER)
@@ -44,7 +44,26 @@ def checksum(data):
     Running this over a whole datagram exactly as received, checksum field
     included, gives zero if and only if nothing changed in transit.
     """
-    raise NotImplementedError
+    # handle odd length data
+    if(len(data) % 2 != 0):
+        # pad with a zero byte
+        data = bytes(data) + b"\x00"
+    # Get the number of 16 bit words in the data
+    # create format string to unpack
+    # ! mean big endian
+    # struct.unpack() convert bytes into tuple of 16 bit integers
+    # sum() add all the integers together
+    # used f"!{len(data)//2}H" to unpack the entire payload 
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    # fold carry bits
+    # right bit shift, removes lower 16 bits - check whether any bits exist beyond the lower 16 bits
+    while (total >> 16):
+        # extract lower 16 bits and extract the above 16 bits
+        # fold carry out of the top back into the lower 16 bits
+        # loop until no overflow
+        total = (total & 0xFFFF) + (total >> 16)
+    #return invert every bit and restrict result to 16 bits
+    return ~total & 0xFFFF
 
 
 class RDTSegment:
@@ -97,7 +116,25 @@ class RDTSegment:
         a damaged length field is a corruption, and the two are otherwise
         indistinguishable.
         """
-        raise NotImplementedError
+        # if checksum() returns 0, it passes the checksum test else atleast 1 bit error detected
+        if(checksum(data) != 0):
+            return "checksum"
+        # if len(data) smaller than Header length, then incomplete / missing information
+        if(len(data) < HEADER_LEN):
+            return "length"
+
+        # unpack header portion of data (check header structure information)
+        seqNum, ackNum, flags, csum, rcvWin, length = struct.unpack(HEADER, data[:HEADER_LEN])
+
+        # check if length specified in header matches with the data present
+        if(length != len(data) - 16):
+            return "length"
+        # check if unused flag bit is being used
+        # 0x00 = data; 0x01 = ack; 0x02 = fin; 0x03 = ack | fin -> 4+ if unused flag spot holds something
+        if (flags  > 3):
+            return "flags"
+        # return none if acceptable
+        return None
 
     @property
     def isAck(self):
@@ -299,7 +336,23 @@ class RdtBuffer:
         Follow putNext: take the Condition, wait_for the state you need, change
         it, notify_all, release.
         """
-        raise NotImplementedError
+        # basically retrieve next segment from buffer in correct order
+        with self.cv:
+            # waits for condition, will release conditional lock while waiting, will reacquire lock and recheck condition once notified
+            # if timeout expires before condition become true -> return false
+            # condition: checks buffer contains a segment at base position and is not None; checks whether buffer has bee closed -> allows waiting thread to stop waiting if buffer is closed and no segments are available
+            scheck = self.cv.wait_for(lambda: self.slots[self.base % self.size] is not None or self.closed, timeout)
+            if not scheck or self.closed:
+                return None
+            # retrieve segment
+            seg = self.slots[self.base % self.size]
+            # remove segment from buffer
+            self.slots[self.base % self.size]  = None
+            # advance base position
+            self.base += 1
+            # notify all other threads currently waiting on the conditional lock
+            self.cv.notify_all()
+            return seg
 
     def putSeqNum(self, seg, index):
         """Place a segment at a logical index that may be ahead of `base`.

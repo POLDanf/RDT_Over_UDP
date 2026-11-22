@@ -50,7 +50,13 @@ class Receiver:
         config.WINDOW until task 5 and segment.checkWindow(protocol) afterward.
         Go-Back-N never needs it: its receive window is one segment.
         """
-        raise NotImplementedError
+        self.sock = sock
+        self.channelAddr = channelAddr
+        self.protocol = protocol
+        self.buffer = segment.RdtBuffer(config.RCV_BUF)
+        self.running = False
+        self.network_thread = None
+        self.lock = threading.Lock()
 
     def start(self):
         """Start the network thread.
@@ -68,8 +74,86 @@ class Receiver:
         flow control in task 3 exists to prevent. Keep the socket call and the
         delivery outside the buffer's Condition and it stays survivable.
         """
-        raise NotImplementedError
+        
+        def sendAck(ackNum):
+            # calculate how many empty slots are available in receiver's buffer
+            rcvWin = self.buffer.freeSlots()
+            # create ack segment
+            ack = RDTSegment(ackNum=ackNum, flags = segment.FLAG_ACK, rcvWin=rcvWin)
+            # send ack to the sender
+            self.sock.sendto(ack.pack(), self.channelAddr)
+            # retrieve next internal sequence index that the receiver expects to receive
+            rcvBase = self.buffer.firstEmpty()
+            segment.traceSend(ack, self.buffer.base, rcvBase, rcvWin)
 
+        def network():
+            # receiver continuously listens for incoming packets
+            while True:
+                # acquires lock before accessing shared variables
+                with self.lock:
+                    # Checks whether sender has been stopped
+                    if not self.running:
+                        break
+                # attempt - receive UDP datagram - max 4096 bytes - returns raw data and address of sender
+                try:
+                    raw, addr = self.sock.recvfrom(4096)
+                # no packet arrived before socket timeout
+                except TimeoutError:
+                    continue
+                # socket-related operating system error
+                except OSError:
+                    break
+                # if packet is empty - ignore and start listening again
+                if not raw:
+                    continue
+                # if packet is not empty - validate packet
+                error = RDTSegment.validate(raw)
+                # error is found - invalid packet
+                if error is not None:
+                    # initialze packet id to -1
+                    ident = -1
+                    # if len of packet is at least as long as expected header
+                    # prevents trying to unpack a packet that is too short
+                    if len(raw) >= segment.HEADER_LEN:
+                        # attempt extract packet fields
+                        bad = RDTSegment.unpack(raw)
+                        if(bad.isAck):
+                            ident = bad.ackNum
+                        else:
+                            ident = bad.seqNum
+                    if error == "checksum":
+                        segment.traceCorrupt(ident)
+                    else: 
+                        segment.traceDrop(ident, error)
+                    continue
+                # no error found - unpack packet
+                pkt = RDTSegment.unpack(raw)
+                # firstEmpty(): retrieves next buffer position that has not yet received a segment
+                # freeSlots(): calculate how many empty buffer slots are available
+                rcvBase = self.buffer.firstEmpty()
+                rcvWin = self.buffer.freeSlots()
+                segment.traceRecv(pkt, self.buffer.base, rcvBase, rcvWin)
+
+                # convert internal rcv index into seq num
+                expectedSeq = segment.mask(rcvBase)
+                # check incoming packet has expected seq num
+                if (pkt.seqNum == expectedSeq):
+                    # insert segment into rcv buffer at appropriate seq index
+                    # send ack for successfull accept segment
+                    if (self.buffer.putNext(pkt)):
+                        sendAck(pkt.seqNum)
+                # handling unexpected seq numbers
+                else:
+                    segment.traceDrop(pkt.seqNum, "window")
+                    # check if receiver already received at least one segment - prevent calculating acknowledgement for negative internal sequence index
+                    # send ack for previuos sequence number
+                    if rcvBase > 0:
+                        sendAck(segment.mask(rcvBase-1))
+        self.sock.settimeout(0.05)
+        self.running = True
+        self.network_thread = threading.Thread(target=network, daemon=True)
+        self.network_thread.start()
+                        
     def receive(self):
         """Return one segment's payload, in order, blocking until there is one.
 
@@ -77,7 +161,13 @@ class Receiver:
         has been handed over. Each segment must be returned exactly once, ever,
         however many times it arrives.
         """
-        raise NotImplementedError
+        # retrieve next segment from buffer in correct order
+        seg = self.buffer.getNext()
+        # if none: no segment available to return
+        if seg is None:
+            return None
+        segment.traceDeliver(seg.seqNum, seg.length)
+        return seg.payload
 
     def waitClosed(self):
         """Block until the connection has been taken down, and report whether

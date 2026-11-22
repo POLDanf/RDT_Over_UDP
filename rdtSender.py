@@ -62,7 +62,15 @@ class Sender:
         Cancelling a timer is then an assignment. The value is config.RTO_INIT
         and it does not change; measuring the path is the bonus.
         """
-        raise NotImplementedError
+        self.sock = sock
+        self.channelAddr = channelAddr
+        self.protocol = protocol
+        self.window = segment.RdtBuffer(config.WINDOW)
+        self.lock = threading.Lock()
+        self.deadline = None
+        self.running = False
+        self.nextIdx = 0
+        self.network_thread = None
 
     def start(self):
         """Start the network thread.
@@ -79,8 +87,103 @@ class Sender:
 
         Do the socket call outside the buffer's Condition, never inside it.
         """
-        raise NotImplementedError
+        # setting socket timeout to 5ms
+        self.sock.settimeout(0.005)
+        # allows network thread to continue executing
+        self.running = True
 
+        def network():
+            # continuously check for incoming packets and expired timers
+            while (True):
+                # acquires lock before accessing shared variables
+                with self.lock:
+                    # Checks whether sender has been stopped
+                    if not self.running:
+                        break
+                try: 
+                    raw, addr = self.sock.recvfrom(4096)
+                # timeout error
+                except TimeoutError:
+                    raw = None
+                # for BlockingIOErrors, Socket closed, ConnectionResetErrors, MSG too long, sys interrupts, etc...
+                except OSError:
+                    break
+
+                # only if something was actually received
+                if (raw is not None):
+                    # checks and validates received packet -> checksum, lengths, flags
+                    error = RDTSegment.validate(raw)
+                    # error found
+                    if (error is not None):
+                        # packet identifier set to -1
+                        ident = -1
+                        # received packet atleast as large as expected header
+                        if (len(raw) >= segment.HEADER_LEN):
+                            # attempst unpack bad packet information
+                            bad = RDTSegment.unpack(raw)
+                            # determine which number to use for identifying invalid packet
+                            if(bad.isAck):
+                                ident = bad.ackNum
+                            else:
+                                ident = bad.seqNum
+                        if (error == "checksum"):
+                            # debuffing trace function for corruptions and etc...
+                            segment.traceCorrupt(ident)
+                        else:
+                            segment.traceDrop(ident, error)
+                    else:
+                        # if no error is found
+                        # convert raw bytes in RDTSegment
+                        # access fields isAck, ackNum, seqNum, rcvWin
+                        pkt = RDTSegment.unpack(raw)
+                        # if received packet is an acknowledgement
+                        # sender only needs to process Acks in this section
+                        if (pkt.isAck):
+                            # read current window state
+                            # acquire buffer condition lock
+                            # Retrieves base: oldest unacknowledged segment
+                            # nxt: next segment index
+                            with self.window.cv:
+                                base = self.window.base
+                                nxt = self.window.next
+                            
+                            segment.traceRecv(pkt, base, nxt, config.WINDOW)
+                            if (nxt > base and pkt.ackNum == segment.mask(base)):
+                                self.window.getNext()
+                                with self.lock:
+                                    self.deadline = None
+                # check expired timers
+                timedOut = False
+                with self.lock:
+                    # Checks: A timer is currently active
+                    # current time has reached or passed its deadline
+                    if (self.deadline is not None and time.monotonic() >= self.deadline):
+                        # restart timer by setting new deadline
+                        self.deadline = time.monotonic() + config.RTO_INIT
+                        # indicate retransmission is required
+                        timedOut = True
+                # if retransmission is required
+                if(timedOut):
+                    # read current sending window
+                    with self.window.cv:
+                        base = self.window.base
+                        nxt = self.window.next
+                    # checks for outstanding segments
+                    if (base < nxt):
+                        # retrieve segment at specified internal index
+                        seg = self.window.get(base)
+                        if (seg is not None):
+                             # record timeout occurance: passes seq number of oldest outstanding segment, internal base index, next index
+                            segment.traceTimeout(segment.mask(base), base, nxt)
+                            # retransmit segment
+                            self.sock.sendto(seg.pack(), self.channelAddr)
+                            segment.traceSend(seg, base, nxt, config.WINDOW)
+        # create and start new thread: 
+        # daemon = True: will not prevent program from exiting if the meain thread finishes
+        self.network_thread = threading.Thread(target=network, daemon=True)
+        self.network_thread.start()
+        
+                            
     def send(self, payload):
         """Hand one segment's worth of data to the protocol.
 
@@ -92,7 +195,24 @@ class Sender:
         reopen it, because there is nothing left to acknowledge. After
         config.PERSIST seconds, transmit anyway.
         """
-        raise NotImplementedError
+        # create new segment
+        # segment.mask(self.nextIdx): convert internal index into seq number
+        seg = RDTSegment(seqNum=segment.mask(self.nextIdx), payload=payload)
+        self.nextIdx += 1
+
+        # attempt insert segmentinto sending window -> window can be full = fail
+        if not (self.window.putNext(seg)):
+            return False
+        with self.window.cv:
+            base = self.window.base
+            nxt = self.window.next
+        with self.lock:
+            # set retransmission deadline
+            self.deadline = time.monotonic() + config.RTO_INIT
+            # send segment to receiver
+            self.sock.sendto(seg.pack(), self.channelAddr)
+            segment.traceSend(seg, base, nxt, config.WINDOW)
+        return True
 
     def close(self):
         """Wait for every segment to be acknowledged, then take the connection
