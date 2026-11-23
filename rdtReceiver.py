@@ -57,6 +57,7 @@ class Receiver:
         self.running = False
         self.network_thread = None
         self.lock = threading.Lock()
+        self.finReceived = threading.Event()
 
     def start(self):
         """Start the network thread.
@@ -75,11 +76,12 @@ class Receiver:
         delivery outside the buffer's Condition and it stays survivable.
         """
         
-        def sendAck(ackNum):
+        def sendAck(ackNum, is_fin = False):
             # calculate how many empty slots are available in receiver's buffer
             rcvWin = self.buffer.freeSlots()
+            flags = segment.FLAG_ACK | (segment.FLAG_FIN if is_fin else 0)
             # create ack segment
-            ack = RDTSegment(ackNum=ackNum, flags = segment.FLAG_ACK, rcvWin=rcvWin)
+            ack = RDTSegment(ackNum=ackNum, flags = flags, rcvWin=rcvWin)
             # send ack to the sender
             self.sock.sendto(ack.pack(), self.channelAddr)
             # retrieve next internal sequence index that the receiver expects to receive
@@ -142,14 +144,16 @@ class Receiver:
                     # insert segment into rcv buffer at appropriate seq index
                     # send ack for successfull accept segment
                     if (self.buffer.putNext(pkt)):
-                        sendAck(pkt.seqNum)
+                        if pkt.isFin:
+                            self.finReceived.set()
+                        sendAck(pkt.seqNum, is_fin=pkt.isFin)
                 # handling unexpected seq numbers
                 else:
                     segment.traceDrop(pkt.seqNum, "window")
                     # check if receiver already received at least one segment - prevent calculating acknowledgement for negative internal sequence index
                     # send ack for previuos sequence number
                     if rcvBase > 0:
-                        sendAck(segment.mask(rcvBase-1))
+                        sendAck(segment.mask(rcvBase-1), is_fin = self.finReceived.is_set())
         self.sock.settimeout(0.05)
         self.running = True
         self.network_thread = threading.Thread(target=network, daemon=True)
@@ -167,6 +171,9 @@ class Receiver:
         # if none: no segment available to return
         if seg is None:
             return None
+        if seg.isFin:
+            self.buffer.close()
+            return None
         segment.traceDeliver(seg.seqNum, seg.length)
         return seg.payload
 
@@ -179,7 +186,24 @@ class Receiver:
         left to answer. Wait a bounded time, answer any further FIN, and only
         then return.
         """
-        raise NotImplementedError
+        # check for aborted / incomplete transfer -> no FIN received
+        # distinguish a normal end of stream from a stalled transfer where the sender crashed and idle exit woke up-> has a FIN arrived
+        if not self.finReceived.is_set():
+            with self.lock: 
+                self.running = False
+            if self.network_thread is not None:
+                self.network_thread.join(timeout=0.2)
+            return False
+
+        linger = time.monotonic() + min(2.0, max(0.5, 4.0 * config.RTO_INIT))
+        while time.monotonic() < linger:
+            time.sleep(0.01)
+
+        with self.lock: 
+            self.running = False
+        if self.network_thread is not None:
+            self.network_thread.join(timeout=0.2)
+        return True
 
 
 # ============================================================================

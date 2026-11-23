@@ -72,6 +72,9 @@ class Sender:
         self.nextIdx = 0
         self.network_thread = None
         self.rcvWindow = config.WINDOW
+        self.timeout = 0
+        self.failed = None
+        self.maxRetries = 10
 
     def start(self):
         """Start the network thread.
@@ -176,6 +179,9 @@ class Sender:
                                     newBase = self.window.base
                                     newNext = self.window.next
                                 with self.lock:
+                                    # reset self.timeout whenever base advances
+                                    if newBase > base:
+                                        self.timeout = 0
                                     # Every segment has now been acknowledged, so the window is completely empty
                                     if newBase == newNext:
                                         self.deadline = None
@@ -200,12 +206,20 @@ class Sender:
                     with self.window.cv:
                         base = self.window.base
                         nxt = self.window.next
-
-                    with self.lock:
-                        # recalculate effective window
-                        win = min(config.WINDOW, self.rcvWindow)
                     # checks for outstanding segments
                     if (base < nxt):
+                        with self.lock:
+                            # count consecutive timeouts without forward progress
+                            self.timeout += 1
+                            # Give up after a certain number of retries rather than hang forever (for when receiver crashes or the final FIN|ACK is repeatedly lost)
+                            if self.timeout >= self.maxRetries:
+                                # record failure reason so main can print and exit
+                                self.failed = "max retries exceeded"
+                                # stop network thread loop and close shared buffer
+                                self.running = False
+                                self.window.close()
+                                break
+                            win = min(config.WINDOW, self.rcvWindow)
                         # record timeout occurance: passes seq number of oldest outstanding segment, internal base index, next index
                         segment.traceTimeout(segment.mask(base), base, nxt)
                         # for every outstanding segment
@@ -275,7 +289,63 @@ class Sender:
         has been acknowledged. Return False if the connection could not be
         closed. Must return within a bounded time in either case.
         """
-        raise NotImplementedError
+        # drain all in flight data segments
+        # ensure every data segment has been received and acknowledged before sending FIN, so the receiver never terminates early with missing data
+        with self.window.cv:
+            if self.window.closed:
+                with self.lock:
+                    self.running = False
+                return False
+            drain = self.window.cv.wait_for(lambda: self.window.outstanding() == 0 or self.window.closed, timeout=max(30.0, 100 * config.RTO_INIT))
+        if not drain or self.window.closed:
+            with self.lock:
+                self.running = False
+            return False
+
+        # build and enqueue the FIN segment (consumes the next sequence number)
+        # sending a FIN consuming the next sequence number
+        # Putting it into self.window lets the network thread's existing timer loop retransmit it if lost
+        finseg = RDTSegment(seqNum=segment.mask(self.nextIdx), flags= segment.FLAG_FIN)
+        self.nextIdx += 1
+        # admit FIN into sending window
+        # if receiver's last ACK advertised rcvWin == 0, wait PERSIST seconds and force FIN through as a probe
+        while not self.window.putNext(finseg, timeout = config.PERSIST):
+            with self.window.cv:
+                if self.window.closed:
+                    with self.lock:
+                        self.running = False
+                    return False
+                nothingOutstanding = (self.window.outstanding() == 0)
+            with self.lock: 
+                zeroWindow = (self.rcvWindow == 0)
+            if zeroWindow and nothingOutstanding:
+                if not self.window.putNext(finseg, force = True):
+                    with self.lock: 
+                        self.running = False
+                    return False
+                break
+        # update window bounds, arm retransmission timer ifneeded and send FIN
+        with self.window.cv:
+            base = self.window.base
+            nxt = self.window.next
+        with self.lock:
+            win = min(config.WINDOW, self.rcvWindow)
+            if self.deadline is None:
+                self.deadline = time.monotonic() + config.RTO_INIT
+            self.sock.sendto(finseg.pack(), self.channelAddr)
+            segment.traceSend(finseg, base, nxt, win)
+
+        # wait for FIN|ACK and shut down cleanly
+        # wait a bounded time for the receiver's FIN|ACK, then stop the network thread
+        maxWait = (self.maxRetries + 1) * config.RTO_INIT
+        with self.window.cv:
+            acked = self.window.cv.wait_for(lambda: self.window.outstanding() == 0 or self.window.closed, timeout=maxWait)
+        with self.lock:
+            self.running = False
+        if self.network_thread is not None:
+            self.network_thread.join(timeout=0.2)
+        # return True only if FIN was acknowledged
+        return bool(acked) and not self.window.closed
 
 
 # ============================================================================
