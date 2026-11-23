@@ -13,7 +13,7 @@ numbers are merely meaningless.
 """
 
 MSS = 100  # payload octets in one data segment
-WINDOW = 1  # N, the protocol window, in SEGMENTS
+WINDOW = 4  # N, the protocol window, in SEGMENTS
 RCV_BUF = 8  # receiver buffer capacity, in SEGMENTS
 SEQ_BITS = 16  # the sequence space has 2 ** SEQ_BITS values
 

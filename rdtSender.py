@@ -146,12 +146,39 @@ class Sender:
                             with self.window.cv:
                                 base = self.window.base
                                 nxt = self.window.next
+                            out = nxt - base
                             
                             segment.traceRecv(pkt, base, nxt, config.WINDOW)
-                            if (nxt > base and pkt.ackNum == segment.mask(base)):
-                                self.window.getNext()
+                            #if (nxt > base and pkt.ackNum == segment.mask(base)):
+                            #    self.window.getNext()
+                            #    with self.lock:
+                            #        self.deadline = None
+
+                            # check if ACK is valid
+                            # out > 0: theres outstanding segments -> otherwise there is nothing to acknowledge
+                            # segment.inWindow(): ACK number must fall within current range of outstanding sequence number
+                            # segment.mask(base): convert internal buffer index into actual sequence number
+                            # prevent sender from processing ACKs that do not correspond to outstanding segments
+                            if (out > 0) and (segment.inWindow(pkt.ackNum, segment.mask(base), out)):
+                                # convert ack number into internal index
+                                offset = (pkt.ackNum - segment.mask(base)) % segment.space()
+                                ackIdx = base + offset
+                                # mark acked for all segments within the range -> cummulative 
+                                for idx in range(base, ackIdx + 1):
+                                    self.window.markAcked(idx)
+                                # check if base has advanced
+                                with self.window.cv:
+                                    newBase = self.window.base
+                                    newNext = self.window.next
                                 with self.lock:
-                                    self.deadline = None
+                                    # Every segment has now been acknowledged, so the window is completely empty
+                                    if newBase == newNext:
+                                        self.deadline = None
+                                    # at least one segment was acknowledged (base moved forward), and there are still unacknowledged segments sitting in the window. -> timer must be restarted to give the new oldest unacknowledged segment a full interval before it times out
+                                    elif newBase > base:
+                                        self.deadline = time.monotonic() + config.RTO_INIT
+                                        
+                                    
                 # check expired timers
                 timedOut = False
                 with self.lock:
@@ -170,14 +197,16 @@ class Sender:
                         nxt = self.window.next
                     # checks for outstanding segments
                     if (base < nxt):
-                        # retrieve segment at specified internal index
-                        seg = self.window.get(base)
-                        if (seg is not None):
-                             # record timeout occurance: passes seq number of oldest outstanding segment, internal base index, next index
-                            segment.traceTimeout(segment.mask(base), base, nxt)
-                            # retransmit segment
-                            self.sock.sendto(seg.pack(), self.channelAddr)
-                            segment.traceSend(seg, base, nxt, config.WINDOW)
+                        # record timeout occurance: passes seq number of oldest outstanding segment, internal base index, next index
+                        segment.traceTimeout(segment.mask(base), base, nxt)
+                        # for every outstanding segment
+                        for idx in range(base, nxt):
+                            # retrieve segment at specified internal index
+                            seg = self.window.get(idx)
+                            if (seg is not None):
+                                # retransmit segment
+                                self.sock.sendto(seg.pack(), self.channelAddr)
+                                segment.traceSend(seg, base, nxt, config.WINDOW)
         # create and start new thread: 
         # daemon = True: will not prevent program from exiting if the meain thread finishes
         self.network_thread = threading.Thread(target=network, daemon=True)
@@ -207,8 +236,9 @@ class Sender:
             base = self.window.base
             nxt = self.window.next
         with self.lock:
-            # set retransmission deadline
-            self.deadline = time.monotonic() + config.RTO_INIT
+            if self.deadline is None:
+                # set retransmission deadline
+                self.deadline = time.monotonic() + config.RTO_INIT
             # send segment to receiver
             self.sock.sendto(seg.pack(), self.channelAddr)
             segment.traceSend(seg, base, nxt, config.WINDOW)

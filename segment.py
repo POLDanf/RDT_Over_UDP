@@ -177,7 +177,8 @@ def inWindow(x, base, n):
     space. Comparing sequence numbers with < instead gives the right answer
     only while the space is large enough never to wrap.
     """
-    raise NotImplementedError
+    # using information in function doc string
+    return ((x - base) % space()) < n
 
 
 def windowLimit(protocol):
@@ -394,7 +395,29 @@ class RdtBuffer:
         which is why one call can free several slots and wake an application
         thread that has been blocked in putNext.
         """
-        raise NotImplementedError
+        with self.cv:
+            # check if index is in [base, next) else return False
+            if not (self.base <= index < self.next):
+                return False
+            # check if index in buffer at index position
+            if (self.slots[index % self.size] is None):
+                return False
+            # acquire segment from buffer at index position
+            seg = self.slots[index % self.size]
+            # mark its acked as True -> main purpose of the function
+            seg.acked = True
+            # basically increment base for each segment in buffer that is not None and is acked until found a segment that is None or a segment that is not acked or base becomes equal to or greater than next
+            # purpose move self.base forward past all consecutively acknowledged segments, freeing their buffer slots along the way
+            while self.base < self.next:
+                s = self.slots[self.base % self.size]
+                if s is not None and s.acked:
+                    self.slots[self.base % self.size] = None
+                    self.base += 1
+                else:
+                    break
+            # notify all other waiting threads
+            self.cv.notify_all()
+            return True
 
 
 # ============================================================================
