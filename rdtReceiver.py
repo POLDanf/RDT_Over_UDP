@@ -137,7 +137,8 @@ class Receiver:
                 # convert internal rcv index into seq num
                 expectedSeq = segment.mask(rcvBase)
                 # check incoming packet has expected seq num
-                if (pkt.seqNum == expectedSeq):
+                # check if the receive buffer is full
+                if (pkt.seqNum == expectedSeq) and self.buffer.freeSlots() > 0:
                     # insert segment into rcv buffer at appropriate seq index
                     # send ack for successfull accept segment
                     if (self.buffer.putNext(pkt)):

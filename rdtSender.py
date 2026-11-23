@@ -71,6 +71,7 @@ class Sender:
         self.running = False
         self.nextIdx = 0
         self.network_thread = None
+        self.rcvWindow = config.WINDOW
 
     def start(self):
         """Start the network thread.
@@ -147,8 +148,12 @@ class Sender:
                                 base = self.window.base
                                 nxt = self.window.next
                             out = nxt - base
+                            with self.lock:
+                                self.rcvWindow = pkt.rcvWin
+                                win = min(config.WINDOW, self.rcvWindow)
+                            self.window.setLimit(win)
                             
-                            segment.traceRecv(pkt, base, nxt, config.WINDOW)
+                            segment.traceRecv(pkt, base, nxt, win)
                             #if (nxt > base and pkt.ackNum == segment.mask(base)):
                             #    self.window.getNext()
                             #    with self.lock:
@@ -195,6 +200,10 @@ class Sender:
                     with self.window.cv:
                         base = self.window.base
                         nxt = self.window.next
+
+                    with self.lock:
+                        # recalculate effective window
+                        win = min(config.WINDOW, self.rcvWindow)
                     # checks for outstanding segments
                     if (base < nxt):
                         # record timeout occurance: passes seq number of oldest outstanding segment, internal base index, next index
@@ -206,7 +215,7 @@ class Sender:
                             if (seg is not None):
                                 # retransmit segment
                                 self.sock.sendto(seg.pack(), self.channelAddr)
-                                segment.traceSend(seg, base, nxt, config.WINDOW)
+                                segment.traceSend(seg, base, nxt, win)
         # create and start new thread: 
         # daemon = True: will not prevent program from exiting if the meain thread finishes
         self.network_thread = threading.Thread(target=network, daemon=True)
@@ -229,19 +238,35 @@ class Sender:
         seg = RDTSegment(seqNum=segment.mask(self.nextIdx), payload=payload)
         self.nextIdx += 1
 
-        # attempt insert segmentinto sending window -> window can be full = fail
-        if not (self.window.putNext(seg)):
-            return False
+        # Wait to admit the segment into the sending window
+        # Uses PERSIST timeout instead of blocking forever so the sender can send a zero-window probe if the receiver's window-update ACK was lost
+        while not self.window.putNext(seg, timeout=config.PERSIST):
+            with self.window.cv: 
+                if self.window.closed:
+                    return False
+                # check that no unacknowledged segments are still inflight
+                nothingOutstanding = (self.window.outstanding() == 0)
+            with self.lock:
+                # confirm that block is caused by the receiver advertising win=0
+                zeroWindow = (self.rcvWindow == 0)
+            # if the window is closed and nothing is in flight to trigger an ACK, force this one segmentinto the buffer as a zero-window probe
+            # a zero window probe is a single segment that the sender deliberately transmits even after the receiver has advertised a receive window of 0, in order to check whether buffer space has reopened on the receiver
+            if zeroWindow and nothingOutstanding:
+                if not self.window.putNext(seg, force=True):
+                    return False
+                break
+
         with self.window.cv:
             base = self.window.base
             nxt = self.window.next
         with self.lock:
+            win = min(config.WINDOW, self.rcvWindow)
             if self.deadline is None:
                 # set retransmission deadline
                 self.deadline = time.monotonic() + config.RTO_INIT
             # send segment to receiver
             self.sock.sendto(seg.pack(), self.channelAddr)
-            segment.traceSend(seg, base, nxt, config.WINDOW)
+            segment.traceSend(seg, base, nxt, win)
         return True
 
     def close(self):
