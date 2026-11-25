@@ -188,7 +188,25 @@ def windowLimit(protocol):
     and the other needs half of it. Work out which, and why, before you write
     this: the reason is a question you will be asked.
     """
-    raise NotImplementedError
+    if (protocol == 'gbn'):
+        # Go-Back-N expects one sequence number (rcvBase) at a time
+        # window up to (2^SEQ_BITS - 1) ensure brand new window of segments can never wrap all the way around and collide with rcvBase
+        # Example for worst case with resolution:
+            # Suppose SEQ_BITS = 3, thus window = 7
+            # Imagine the sender transmits 8 packets, and the receiver receives all 8 in order and delivers them and advances the window. rcvBase goes to 8 and wraps back down to 0. Problem occurs if all 8 acks are lost, and the sender retransmits packet 0, the receiver with rcvBase = 0 will now think that the retransmitted segments are brand new segments and corrupt the file. 
+            # So for gbn, window <= space() -1 guarantees rcvBase lands on the one unused sequence number preventing wraparound collision.
+        return space() -1
+    elif (protocol == 'sr'):
+        # Selective Repeat biffer out-of-order segments across an entier window. Receiver accpets any sequence number in range [rcvBase, rcvBase + N]
+        # Example:
+            # Suppose SEQ_BITS = 3, lets try window = 5 too see that for sr, window should be space()//2 so window should be 4, so lets see if 5 breaks it.
+            # Imagine the sender transmits 5 packets , and the receiver receives all 5 in order and delivers them and then advances the window to [5, 5+5] mod 8. Suppose the packets delivered were {0, 1, ..., 4}. The window then corresponds to {}.
+            # If all 5 acks are lost, and the sender times out and retransmits 0. Because 0 is inside the window {5, 6, 7, 0, 1}, the receiver has no way to tell whether arriving packet 0 is a retransmission of an old packet or a brand new packet. The receiver would then accept the old 0 packet as new data corrupting the stream.
+            # Solution: if window is space // 2, so for this case (SEQ_BITS = 3, window = 4)
+            # The sender sends {0, 1, 2, 3}. The receiver delivers them and advances the window to [5, 5+5] mod 8 = {5, 6, 7, 0, 1}. Worst case is if all five acks were lost in the channel. The sender times out retransmits. When retransmitting packet 0, the receiver has no way to tell whether arriving packet 0 is a retransmission or a brand new packet.
+            # Solution: if window=4 in this situation. If the sender transmits {0, 1, 2, 3}, and the receiver receives all four, delivers them and slides its receive window forward to [4, 4+4] mod 8 = {4, 5, 6, 7}. Worst case is if all four acks are lost in the channel, the sender timeout and restransmits {0, 1, 2, 3} and since none of them appear in the window, the receiver can recognize them as already-delivered duplicates
+        return space()//2
+    raise ValueError(f"Unknown protocol: {protocol}")
 
 
 # --- GIVEN WINDOW CHECK - do not modify ---
@@ -374,7 +392,20 @@ class RdtBuffer:
         rdtReceiver.py. Placing a segment at the wrong index is therefore not a
         local mistake: it delivers the file in the wrong order.
         """
-        raise NotImplementedError
+        with self.cv:
+            # reject segments outside receiver's buffer cap
+            # never overwrite unread data waiting for app thread
+            if not(self.base <= index < self.base + self.size):
+                return False
+            # reject dup retransmissions if slot occupied
+            if self.slots[index % self.size] is not None:
+                return False
+            # placing segment at logical index (useful for when segments arrives out of order)
+            self.slots[index % self.size] = seg
+            # next must end up 1 past the highest index placed
+            self.next = max(self.next, index + 1)
+            self.cv.notify_all()
+            return True
 
     def markAcked(self, index):
         """Flag the segment at `index`, then slide base past a run of acked slots.

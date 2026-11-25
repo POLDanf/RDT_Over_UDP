@@ -58,6 +58,7 @@ class Receiver:
         self.network_thread = None
         self.lock = threading.Lock()
         self.finReceived = threading.Event()
+        self.srWin = segment.checkWindow(protocol)
 
     def start(self):
         """Start the network thread.
@@ -138,22 +139,58 @@ class Receiver:
 
                 # convert internal rcv index into seq num
                 expectedSeq = segment.mask(rcvBase)
-                # check incoming packet has expected seq num
-                # check if the receive buffer is full
-                if (pkt.seqNum == expectedSeq) and self.buffer.freeSlots() > 0:
-                    # insert segment into rcv buffer at appropriate seq index
-                    # send ack for successfull accept segment
-                    if (self.buffer.putNext(pkt)):
-                        if pkt.isFin:
-                            self.finReceived.set()
+                if self.protocol == "sr":
+                    # selective repeat recognize two distinct sequence number ranges:
+                        # current receive window: [rcvBase, rcvBase + srWin) -> buffer and ack
+                        # previuos window: [rcvBase - srWin, rcvBase) -> already delivered, but its ack may have been lost, so we must re-ack it so the sender can slide its window forward
+                    prevCount = min(rcvBase, self.srWin)
+                    prevStart = segment.mask(rcvBase - prevCount)
+                    if segment.inWindow(pkt.seqNum, expectedSeq, self.srWin):
+                        # segment falls inside current receive window
+                        # map seqNum to ligical buffer index ahead of rcvBase
+                        offset = (pkt.seqNum - expectedSeq) % segment.space()
+                        targetIdx = rcvBase + offset
+                        if self.buffer.putSeqNum(pkt, targetIdx):
+                            # newly buffered in window segment. Record FIN status. Send ACK.
+                            if pkt.isFin:
+                                self.finReceived.set()
+                            sendAck(pkt.seqNum, is_fin = pkt.isFin)
+                        else:
+                            # putSeqNu, returned False either: 
+                                # slot already occupied (duplicate)
+                                # targetIdx >= base + RCV_BUF (buffer full)
+                            segment.traceDrop(pkt.seqNum, "window")
+                            # if dup sittingin buffer, re-ack.
+                            # if buffer is full, stay silent so flow control holds
+                            if self.buffer.get(targetIdx) is not None:
+                                sendAck(pkt.seqNum, is_fin=pkt.isFin)
+                    elif prevCount > 0 and segment.inWindow(pkt.seqNum, prevStart, prevCount):
+                        # segment was already delivered and popped by getNext()
+                        # sender never got our earlier ack
+                        # drop dup payload and resend individual ack so sender stops retransmitting it
+                        segment.traceDrop(pkt.seqNum, "window")
                         sendAck(pkt.seqNum, is_fin=pkt.isFin)
-                # handling unexpected seq numbers
+                    else:
+                        # if completely outside both windows: discard silently
+                        segment.traceDrop(pkt.seqNum, "window")
                 else:
-                    segment.traceDrop(pkt.seqNum, "window")
-                    # check if receiver already received at least one segment - prevent calculating acknowledgement for negative internal sequence index
-                    # send ack for previuos sequence number
-                    if rcvBase > 0:
-                        sendAck(segment.mask(rcvBase-1), is_fin = self.finReceived.is_set())
+                    # gbn accepts only single expected sequence number (rcvBase) and drops/re-acks rcvBase -1 for everything else
+                    # check incoming packet has expected seq num
+                    # check if the receive buffer is full
+                    if (pkt.seqNum == expectedSeq) and self.buffer.freeSlots() > 0:
+                        # insert segment into rcv buffer at appropriate seq index
+                        # send ack for successfull accept segment
+                        if (self.buffer.putNext(pkt)):
+                            if pkt.isFin:
+                                self.finReceived.set()
+                            sendAck(pkt.seqNum, is_fin=pkt.isFin)
+                    # handling unexpected seq numbers
+                    else:
+                        segment.traceDrop(pkt.seqNum, "window")
+                        # check if receiver already received at least one segment - prevent calculating acknowledgement for negative internal sequence index
+                        # send ack for previuos sequence number
+                        if rcvBase > 0:
+                            sendAck(segment.mask(rcvBase-1), is_fin = self.finReceived.is_set())
         self.sock.settimeout(0.05)
         self.running = True
         self.network_thread = threading.Thread(target=network, daemon=True)
